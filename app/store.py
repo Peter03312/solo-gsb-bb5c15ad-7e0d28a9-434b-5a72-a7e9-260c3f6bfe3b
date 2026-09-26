@@ -10,6 +10,7 @@ from typing import Any
 from . import audit, db, evidence, rules, undo
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .release_plan import build_preview
 from .reuse import (
     build_reuse_plan,
     match_to_batch_item,
@@ -980,3 +981,37 @@ def undo_last_resolution(merge_id: str, expected_revision: int) -> dict:
     view["restored_pointers"] = restored_pointers
     view["restored_count"] = len(restored_pointers)
     return view
+
+
+# ---------------------------------------------------------------------------
+# Read-only release-plan preview
+# ---------------------------------------------------------------------------
+
+
+def preview_release_plan(nodes: list[dict]) -> dict:
+    """Preview stable release batches for a dependency graph of merge orders.
+
+    Read-only: the nodes are validated as an acyclic graph whose edges
+    point at other listed nodes, their current status/revision is fetched
+    from SQLite, and release batches are computed entirely in memory.
+    Nothing is written and no merge row is updated, so the preview never
+    bumps a revision. Raises release_plan.InvalidReleasePlan (400) for
+    duplicate nodes, self-dependencies, dangling edges, cycles or merges
+    that do not exist.
+    """
+    merge_ids = [node["merge_id"] for node in nodes]
+    # SQLite caps host parameters at 999 on older builds; fetch the rows
+    # in chunks while preserving read-only access (no transaction needed).
+    state: dict[str, dict] = {}
+    for start in range(0, len(merge_ids), 500):
+        chunk = merge_ids[start : start + 500]
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in db.query_all(
+            f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
+            tuple(chunk),
+        ):
+            state[row["id"]] = {
+                "status": row["status"],
+                "revision": row["revision"],
+            }
+    return build_preview(nodes, state)

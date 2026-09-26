@@ -14,11 +14,13 @@ from .models import (
     EvidencePackage,
     MergeAnalysisRequest,
     MergeCreate,
+    ReleasePlanPreviewRequest,
     ResolutionUndoRequest,
     ResolveRequest,
     ReuseResolutionsRequest,
     RuleResolveRequest,
 )
+from .release_plan import InvalidReleasePlan
 from .validation import InvalidResultSchema, ResultValidationFailed
 
 
@@ -164,6 +166,16 @@ async def audit_chain_broken_handler(request: Request, exc: store.AuditChainBrok
             "Inspect GET /merges/{merge_id}/audit for the first invalid event"
         },
     )
+
+
+@app.exception_handler(InvalidReleasePlan)
+async def invalid_release_plan_handler(request: Request, exc: InvalidReleasePlan):
+    # The plan itself is malformed (duplicate node, self-dependency,
+    # dangling edge or cycle) or references an unknown merge: the whole
+    # request fails with 400 and no state is read for batching.
+    content = {"detail": str(exc), "reason": exc.reason}
+    content.update(exc.extra)
+    return JSONResponse(status_code=400, content=content)
 
 
 @app.exception_handler(InvalidResultSchema)
@@ -460,3 +472,35 @@ def commit_draft(merge_id: str, draft_id: str):
     written.
     """
     return store.commit_draft(merge_id, draft_id)
+
+
+# ---------------------------------------------------------------------------
+# Release orchestration preview
+# ---------------------------------------------------------------------------
+
+
+@app.post("/release-plans/preview")
+def preview_release_plan(body: ReleasePlanPreviewRequest):
+    """Preview stable release batches for a graph of existing merge orders.
+
+    Each request node names an existing ``merge_id`` and the ``depends_on``
+    prerequisites that must ship first. The endpoint only references
+    existing merges and reads their current status/revision — it writes
+    nothing and bumps no revision. Node merge_ids must be unique; every
+    prerequisite must be a node in the same list, and self-dependencies and
+    cycles are rejected. A duplicate/dangling/cyclic graph or an unknown
+    merge fails the whole request with 400.
+
+    Publishable nodes — merges that are ``resolved`` and whose
+    prerequisites are all publishable — are peeled off dependency layer by
+    dependency layer, one layer per release batch; nodes inside a batch are
+    sorted by ``merge_id``. Every other node appears under ``blocked``: a
+    still-pending merge is reported as ``pending`` (its own blocker), while
+    a resolved merge whose prerequisites cannot ship is
+    ``dependency_blocked`` and names the directly blocking dependency
+    nodes. Each node carries its current ``revision`` so the caller can
+    tell whether the plan has gone stale since it was composed.
+    """
+    return store.preview_release_plan(
+        [node.model_dump() for node in body.nodes]
+    )

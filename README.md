@@ -70,6 +70,7 @@ EVIDENCE_HMAC_KEY=<至少 32 字节的随机密钥> docker compose up --build
 | `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
 | `GET` | `/merges/{merge_id}/evidence` | 导出可移植证据包：base、不可变 result、确定性 patch、完整审计事件与生成时间的签名载荷（仅 resolved） |
 | `POST` | `/evidence/verify` | 校验证据包（不访问数据库）：常量时间比对签名 → 审计链连续性 → 重放 patch，按固定顺序返回首个失败阶段 |
+| `POST` | `/release-plans/preview` | 合并结果发布编排预览：校验 merge_id/依赖图并按依赖层级计算稳定发布批次，只读不写库 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -705,6 +706,73 @@ curl -s -X POST http://localhost:8000/evidence/verify \
 - 请求体结构不合法（缺字段、多字段、事件结构不符）→ **`422`**，在进入任何校验阶段之前拒绝。
 - 校验只依赖包内容与 `EVIDENCE_HMAC_KEY`，不读取 SQLite，因此适合把证据包交给第三方或归档系统独立核验。
 
+### 13. 发布编排预览 — `POST /release-plans/preview`
+
+多个合并单需要按依赖关系分批发布时（例如先发基础配置、再发依赖它的服务），可把发布计划描述为一个**节点列表**：每个节点是一个**已存在的合并单**（`merge_id`）加上它的前置节点（`depends_on`，即必须先发布的合并单）。接口读取这些合并单的**当前状态**并按依赖图计算稳定的发布批次：
+
+- **只读、不写库**：仅引用现有合并单并读取 `status` / `revision`，不创建任何记录、不更新状态、不递增 revision、不追加审计事件，可安全反复调用；
+- **整单校验**：节点 `merge_id` 必须唯一；每个 `depends_on` 都必须指向**同一列表内的节点**；不允许自依赖与环；引用未知合并单同样使**整个请求报错（`400`）**，不会返回部分批次；
+- **稳定批次**：一个节点可发布当且仅当它已 `resolved` **且**其全部前置节点都可发布。节点按依赖层级逐层剥离，每层是一个发布批次（`batch` 从 1 开始），**同一批次内按 `merge_id` 字典序排序**，因此相同图与相同状态下响应逐字节稳定；
+- **阻塞节点**：未入批的节点全部列入 `blocked`：自身仍为 `pending` 的节点标为 `reason: "pending"`（`blocked_by` 为空，表示待处理的是它自己）；自身已 `resolved` 但前置尚不可发布的节点标为 `reason: "dependency_blocked"`，`blocked_by` 列出**直接**阻塞它的前置节点（排序、去重）；
+- **revision 随行**：`batches` 与 `blocked` 中的每个节点都带当前 `revision`，调用方可在后续预览/发布时比对，识别计划是否已过期（例如某个节点被重新裁决过）。
+
+```bash
+curl -s -X POST http://localhost:8000/release-plans/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"merge_id": "a1b2c3…", "depends_on": []},
+      {"merge_id": "d4e5f6…", "depends_on": ["a1b2c3…"]},
+      {"merge_id": "778899…", "depends_on": ["a1b2c3…", "d4e5f6…"]}
+    ]
+  }'
+```
+
+响应（三个合并单均已 `resolved`，按依赖层级分为 3 批）：
+
+```json
+{
+  "batches": [
+    {"batch": 1, "nodes": [{"merge_id": "a1b2c3…", "revision": 2}]},
+    {"batch": 2, "nodes": [{"merge_id": "d4e5f6…", "revision": 1}]},
+    {"batch": 3, "nodes": [{"merge_id": "778899…", "revision": 1}]}
+  ],
+  "blocked": []
+}
+```
+
+存在不可发布节点时（`a1b2c3…` 已 resolved、`d4e5f6…` 仍 pending、`778899…` resolved 但依赖前两者）：
+
+```json
+{
+  "batches": [
+    {"batch": 1, "nodes": [{"merge_id": "a1b2c3…", "revision": 2}]}
+  ],
+  "blocked": [
+    {"merge_id": "d4e5f6…", "revision": 1, "reason": "pending", "blocked_by": []},
+    {"merge_id": "778899…", "revision": 1,
+     "reason": "dependency_blocked", "blocked_by": ["d4e5f6…"]}
+  ]
+}
+```
+
+非法计划整体报错（`400`），响应携带机器可读的 `reason` 及定位字段，且**不返回任何批次**：
+
+| `reason` | 含义 | 附加字段 |
+| --- | --- | --- |
+| `duplicate_merge_id` | 同一 `merge_id` 在节点列表中重复出现 | `merge_id` |
+| `self_dependency` | 节点把自己列入 `depends_on` | `merge_id` |
+| `dependency_not_in_plan` | 某个前置不是列表内节点 | `merge_id`、`dependency` |
+| `dependency_cycle` | 依赖图存在环 | `cycle`（首尾相同的节点路径，稳定选取） |
+| `unknown_merge` | 引用了不存在的合并单 | `merge_ids`（全部未知 ID，排序） |
+
+其余约定：
+
+- `nodes` 至少包含一个节点、`merge_id` 为非空字符串（否则 `422`）；`depends_on` 可省略（默认空），其中重复项会被去重，不影响批次计算。
+- 校验顺序固定：重复 ID → 自依赖 → 前置不在列表内 → 环 → 未知合并单；响应在首个失败类别处返回，因此一个非法图不会被部分评估。
+- 节点的请求声明顺序不影响结果：批次只由依赖边与合并单当前状态决定。
+- 该接口不接受也不需要 `revision`：它反映的是**调用时刻**各合并单的最新状态；是否过期由响应中每个节点的 `revision` 体现。
+
 ## 本地开发与测试
 
 ```bash
@@ -712,7 +780,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（210 项）
+python -m pytest tests/ -q                  # 运行测试（227 项）
 ```
 
 ## 项目结构
@@ -729,10 +797,11 @@ app/
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
   audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验（含纯函数链校验供证据包使用）
   evidence.py   # 可移植证据包：规范化载荷 + HMAC-SHA256 签名；免数据库三阶段校验（签名→审计链→补丁重放）
-  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出：revision 校验、冲突解决、不可变结果、schema 门禁
+  release_plan.py # 发布编排预览（纯内存）：依赖图校验（唯一/自依赖/悬空/环）+ 按依赖层级的稳定发布批次与阻塞原因
+  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出 + 发布计划只读查询：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
-  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、证据包校验请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放与证据包篡改/伪造/断链/错误补丁测试）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、发布计划预览、证据包校验请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放、证据包篡改/伪造/断链/错误补丁与发布编排预览测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

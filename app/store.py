@@ -10,6 +10,11 @@ from typing import Any
 from . import audit, db, evidence, rules, undo
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .release import (
+    UnknownPlanMerge,
+    build_release_plan,
+    normalize_graph,
+)
 from .reuse import (
     build_reuse_plan,
     match_to_batch_item,
@@ -980,3 +985,32 @@ def undo_last_resolution(merge_id: str, expected_revision: int) -> dict:
     view["restored_pointers"] = restored_pointers
     view["restored_count"] = len(restored_pointers)
     return view
+
+
+# ---------------------------------------------------------------------------
+# Release-plan preview: read-only dependency-graph orchestration
+# ---------------------------------------------------------------------------
+
+
+def preview_release_plan(nodes: list[dict]) -> dict:
+    """Preview stable release batches for a graph of existing merge orders.
+
+    The node graph is validated first (unique IDs, no self-dependency, every
+    prerequisite present in the list, acyclic); only then is the database
+    read once for the current status/revision of every referenced merge.
+    Unknown merge orders reject the whole request. Strictly read-only: no
+    writes, no revision changes, no audit events.
+    """
+    graph = normalize_graph(nodes)
+
+    placeholders = ", ".join("?" for _ in graph)
+    rows = db.query_all(
+        f"SELECT id, status, revision FROM merges WHERE id IN ({placeholders})",
+        tuple(graph),
+    )
+    merges = {row["id"]: dict(row) for row in rows}
+    missing = sorted(set(graph) - set(merges))
+    if missing:
+        raise UnknownPlanMerge(missing[0])
+
+    return build_release_plan(graph, merges)

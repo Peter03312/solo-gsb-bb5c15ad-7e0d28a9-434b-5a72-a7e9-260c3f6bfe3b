@@ -70,6 +70,7 @@ EVIDENCE_HMAC_KEY=<至少 32 字节的随机密钥> docker compose up --build
 | `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
 | `GET` | `/merges/{merge_id}/evidence` | 导出可移植证据包：base、不可变 result、确定性 patch、完整审计事件与生成时间的签名载荷（仅 resolved） |
 | `POST` | `/evidence/verify` | 校验证据包（不访问数据库）：常量时间比对签名 → 审计链连续性 → 重放 patch，按固定顺序返回首个失败阶段 |
+| `POST` | `/release-plans/preview` | 发布编排预览：按合并单依赖图输出稳定发布批次与 blocked 节点，只读取当前状态、不落库 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -705,6 +706,67 @@ curl -s -X POST http://localhost:8000/evidence/verify \
 - 请求体结构不合法（缺字段、多字段、事件结构不符）→ **`422`**，在进入任何校验阶段之前拒绝。
 - 校验只依赖包内容与 `EVIDENCE_HMAC_KEY`，不读取 SQLite，因此适合把证据包交给第三方或归档系统独立核验。
 
+### 13. 发布编排预览 — `POST /release-plans/preview`
+
+多个合并单需要按依赖顺序发布时，可提交一张由**节点**（`merge_id` + 其前置 `depends_on`）组成的依赖图，服务读取这些**现有合并单的当前状态**，按图输出稳定的发布批次。接口**只引用现有合并单、只读取当前状态，不写库**：不创建记录、不递增 revision、不追加审计事件，可安全反复调用。
+
+请求示例：
+
+```bash
+curl -s -X POST http://localhost:8000/release-plans/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"merge_id": "a1b2c3…", "depends_on": []},
+      {"merge_id": "d4e5f6…", "depends_on": ["a1b2c3…"]},
+      {"merge_id": "7a8b9c…", "depends_on": ["a1b2c3…", "d4e5f6…"]}
+    ]
+  }'
+```
+
+响应（假设 `d4e5f6…` 尚为 `pending`）：
+
+```json
+{
+  "batches": [
+    {"batch": 1, "merge_ids": ["a1b2c3…"]}
+  ],
+  "blocked": [
+    {"merge_id": "7a8b9c…", "reason": "blocked_by_dependency", "blocked_by": "d4e5f6…"},
+    {"merge_id": "d4e5f6…", "reason": "self_pending", "blocked_by": null}
+  ],
+  "nodes": [
+    {"merge_id": "a1b2c3…", "status": "resolved", "revision": 2, "depends_on": []},
+    {"merge_id": "d4e5f6…", "status": "pending",  "revision": 1, "depends_on": ["a1b2c3…"]},
+    {"merge_id": "7a8b9c…", "status": "resolved", "revision": 1, "depends_on": ["a1b2c3…", "d4e5f6…"]}
+  ]
+}
+```
+
+**图校验**（任何一项不通过 → 整单 **`400`**，响应体 `reason` 标明类型，不读取任何合并单之外的数据、也不产生批次）：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `duplicate_node` | 节点 `merge_id` 重复（响应附 `merge_id`） |
+| `self_dependency` | 节点把自己列入 `depends_on`（响应附 `merge_id`） |
+| `unknown_dependency` | 依赖的 ID 不在本次节点列表内（响应附 `merge_id` 与 `missing_dependency`） |
+| `cycle_detected` | 依赖图存在环（响应附环上节点 `cycle`） |
+| `unknown_merge` | 节点引用的合并单在数据库中不存在（响应附 `merge_id`）；即使其余节点可发布，也整体报错 |
+
+**批次编排规则**：
+
+- **可发布（publishable）**：节点自身合并单为 `resolved`，**且其全部前置节点都可发布**。可发布节点按依赖深度（最长前置链）分层输出为 `batches`：第 1 批无前置，每一批只依赖更早的批次；**同批内按 `merge_id` 字典序排序**。无任何可发布节点时 `batches` 为 `[]`。
+- **阻塞（blocked）**：所有不可发布节点列入 `blocked`（按 `merge_id` 排序），每项给出：
+  - `reason: "self_pending"`、`blocked_by: null`：本节点自身仍为 `pending`，待本节点处理；
+  - `reason: "blocked_by_dependency"`、`blocked_by: <id>`：本节点已 `resolved`，但被某个**直接前置**节点阻塞；当多个直接前置都不可发布时，取 `merge_id` 字典序最小的一个，保证结果稳定。
+  - 自身 `pending` 同时又有阻塞前置的节点，优先报告 `self_pending`（先要处理的是本节点）。
+- **revision 识别过期**：`nodes` 为每个节点附当前 `status`、`revision` 与规范化（去重、排序）后的 `depends_on`。调用方可对比自己持有计划时的 revision，判断合并单是否已被其他请求推进、计划是否过期。`depends_on` 中的重复依赖会被去重后原样回显。
+
+其余约定：
+
+- 请求体结构不合法（`nodes` 为空或缺字段、`merge_id` 为空字符串、`depends_on` 不是数组等）→ **`422`**。
+- 该接口不接受也不需要 `revision`：它不修改任何合并单，仅以请求时刻的状态给出一次性预览；再次调用即按最新状态重新编排。
+
 ## 本地开发与测试
 
 ```bash
@@ -712,7 +774,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（210 项）
+python -m pytest tests/ -q                  # 运行测试（233 项）
 ```
 
 ## 项目结构
@@ -729,10 +791,11 @@ app/
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
   audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验（含纯函数链校验供证据包使用）
   evidence.py   # 可移植证据包：规范化载荷 + HMAC-SHA256 签名；免数据库三阶段校验（签名→审计链→补丁重放）
-  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出：revision 校验、冲突解决、不可变结果、schema 门禁
+  release.py    # 发布编排预览（纯图逻辑）：节点去重/自依赖/越界依赖/成环校验 + 可发布分层批次与 blocked 归因（不落库）
+  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销 + 证据包导出 + 发布计划预览：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
-  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、证据包校验请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放与证据包篡改/伪造/断链/错误补丁测试）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求、证据包校验请求、发布计划预览请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链、撤销重放、证据包与发布计划预览测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

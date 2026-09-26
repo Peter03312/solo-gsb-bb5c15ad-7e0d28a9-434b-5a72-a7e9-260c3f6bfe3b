@@ -100,6 +100,32 @@ class ResolutionUndoRequest(BaseModel):
     revision: int = Field(..., description="Current merge revision (409 if stale)")
 
 
+class ReleasePlanNode(BaseModel):
+    merge_id: str = Field(
+        ...,
+        min_length=1,
+        description="ID of an existing merge order referenced by the plan",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "IDs of nodes that must be published first; every entry must "
+            "itself be a node in the same request"
+        ),
+    )
+
+
+class ReleasePlanPreviewRequest(BaseModel):
+    nodes: list[ReleasePlanNode] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Plan nodes (merge_id + prerequisites). IDs must be unique; the "
+            "dependency graph must stay inside the list and be acyclic."
+        ),
+    )
+
+
 class EvidenceAuditEvent(BaseModel):
     """One audit event as embedded in an evidence package.
 

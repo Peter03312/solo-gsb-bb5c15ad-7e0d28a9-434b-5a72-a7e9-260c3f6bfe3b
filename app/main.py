@@ -7,13 +7,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import db, evidence, store
+from . import db, evidence, release, store
 from .analysis import analyze_merge
 from .models import (
     DraftUpdateRequest,
     EvidencePackage,
     MergeAnalysisRequest,
     MergeCreate,
+    ReleasePlanPreviewRequest,
     ResolutionUndoRequest,
     ResolveRequest,
     ReuseResolutionsRequest,
@@ -164,6 +165,23 @@ async def audit_chain_broken_handler(request: Request, exc: store.AuditChainBrok
             "Inspect GET /merges/{merge_id}/audit for the first invalid event"
         },
     )
+
+
+@app.exception_handler(release.InvalidReleaseGraph)
+async def invalid_release_graph_handler(
+    request: Request, exc: release.InvalidReleaseGraph
+):
+    # Every structural problem with a release-plan request (duplicate node,
+    # self-dependency, prerequisite outside the list, cycle, unknown merge)
+    # rejects the whole request: 400 and nothing is read into a plan.
+    content: dict = {"detail": exc.detail, "reason": exc.reason}
+    if hasattr(exc, "merge_id"):
+        content["merge_id"] = exc.merge_id
+    if isinstance(exc, release.CyclicReleaseGraph):
+        content["cycle"] = exc.nodes
+    if isinstance(exc, release.UnknownDependency):
+        content["missing_dependency"] = exc.missing
+    return JSONResponse(status_code=400, content=content)
 
 
 @app.exception_handler(InvalidResultSchema)
@@ -460,3 +478,34 @@ def commit_draft(merge_id: str, draft_id: str):
     written.
     """
     return store.commit_draft(merge_id, draft_id)
+
+
+# ---------------------------------------------------------------------------
+# Release-plan orchestration preview
+# ---------------------------------------------------------------------------
+
+
+@app.post("/release-plans/preview")
+def preview_release_plan(body: ReleasePlanPreviewRequest):
+    """Preview stable release batches for a graph of existing merge orders.
+
+    The request lists plan nodes, each a ``merge_id`` plus the IDs of the
+    nodes it depends on. Only existing merge orders are referenced and
+    only their current state is read: nothing is written, no revision is
+    bumped and no audit event is recorded. IDs must be unique, every
+    prerequisite must be a node in the same list, self-dependencies and
+    cycles are rejected, and an unknown merge order fails the whole
+    request.
+
+    Resolved nodes whose prerequisites are all publishable are emitted as
+    ordered, dependency-respecting ``batches`` (sorted by ``merge_id``
+    within a batch). Pending nodes and everything reachable through them
+    are listed in ``blocked``: a pending node reports ``self_pending``,
+    a resolved node reports ``blocked_by_dependency`` together with the
+    direct prerequisite that holds it. Each node also carries its current
+    ``revision`` so the caller can detect that the merge moved on since
+    the plan was assembled.
+    """
+    return store.preview_release_plan(
+        [node.model_dump() for node in body.nodes]
+    )
